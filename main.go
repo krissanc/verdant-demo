@@ -8,52 +8,29 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/lib/pq"
 )
 
-var db *sql.DB
-var tmpl *template.Template
+var (
+	db     *sql.DB
+	dbReady atomic.Bool
+	dbOnce  sync.Once
+	tmpl   *template.Template
+)
 
 func main() {
 	var err error
-
 	tmpl, err = template.ParseGlob("templates/*.html")
 	if err != nil {
 		log.Fatalf("failed to parse templates: %v", err)
 	}
 
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL is required")
-	}
-
-	db, err = sql.Open("postgres", dbURL)
-	if err != nil {
-		log.Fatalf("failed to open db: %v", err)
-	}
-	defer db.Close()
-
-	for i := 0; i < 15; i++ {
-		if err = db.Ping(); err == nil {
-			break
-		}
-		log.Printf("db not ready, retry %d/15: %v", i+1, err)
-		time.Sleep(3 * time.Second)
-	}
-	if err != nil {
-		log.Fatalf("db connection failed: %v", err)
-	}
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS waitlist (
-		id         SERIAL PRIMARY KEY,
-		email      TEXT UNIQUE NOT NULL,
-		created_at TIMESTAMPTZ DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Fatalf("failed to create table: %v", err)
-	}
+	// Connect to DB in background — server starts immediately regardless.
+	go connectDB()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -73,7 +50,50 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
 
+func connectDB() {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Println("DATABASE_URL not set — running without database (set it and redeploy)")
+		return
+	}
+
+	var err error
+	db, err = sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Printf("db open error: %v", err)
+		return
+	}
+
+	for i := 0; i < 30; i++ {
+		if err = db.Ping(); err == nil {
+			break
+		}
+		log.Printf("db not ready, retry %d/30: %v", i+1, err)
+		time.Sleep(5 * time.Second)
+	}
+	if err != nil {
+		log.Printf("db connection failed after retries: %v", err)
+		return
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS waitlist (
+		id         SERIAL PRIMARY KEY,
+		email      TEXT UNIQUE NOT NULL,
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("failed to create table: %v", err)
+		return
+	}
+
+	dbReady.Store(true)
+	log.Println("database connected and ready")
+}
+
 func signupCount() int {
+	if !dbReady.Load() {
+		return 0
+	}
 	var n int
 	db.QueryRow("SELECT COUNT(*) FROM waitlist").Scan(&n)
 	return n
@@ -85,7 +105,8 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := map[string]interface{}{
-		"Count": signupCount(),
+		"Count":   signupCount(),
+		"DBReady": dbReady.Load(),
 	}
 	if err := tmpl.ExecuteTemplate(w, "index.html", data); err != nil {
 		http.Error(w, "template error", 500)
@@ -96,6 +117,11 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 func handleJoin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !dbReady.Load() {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<p class="mt-3 text-amber-400 text-sm">Database is warming up — try again in a moment.</p>`)
 		return
 	}
 
