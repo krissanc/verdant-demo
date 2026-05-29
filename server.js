@@ -20,7 +20,8 @@ function initDb() {
     console.log('DATABASE_URL not set — running without database (set it and redeploy)');
     return;
   }
-  pool = new Pool({ connectionString: url, ssl: { rejectUnauthorized: false } });
+  const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
+  pool = new Pool({ connectionString: url, ...(isLocal ? {} : { ssl: { rejectUnauthorized: false } }) });
 
   (async () => {
     let attempts = 0;
