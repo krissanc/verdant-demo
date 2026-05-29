@@ -1,0 +1,135 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	_ "github.com/lib/pq"
+)
+
+var db *sql.DB
+var tmpl *template.Template
+
+func main() {
+	var err error
+
+	tmpl, err = template.ParseGlob("templates/*.html")
+	if err != nil {
+		log.Fatalf("failed to parse templates: %v", err)
+	}
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	db, err = sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 15; i++ {
+		if err = db.Ping(); err == nil {
+			break
+		}
+		log.Printf("db not ready, retry %d/15: %v", i+1, err)
+		time.Sleep(3 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("db connection failed: %v", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS waitlist (
+		id         SERIAL PRIMARY KEY,
+		email      TEXT UNIQUE NOT NULL,
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Fatalf("failed to create table: %v", err)
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleHome)
+	mux.HandleFunc("/join", handleJoin)
+	mux.HandleFunc("/count", handleCount)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, "ok")
+	})
+
+	log.Printf("verdant starting on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+func signupCount() int {
+	var n int
+	db.QueryRow("SELECT COUNT(*) FROM waitlist").Scan(&n)
+	return n
+}
+
+func handleHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	data := map[string]interface{}{
+		"Count": signupCount(),
+	}
+	if err := tmpl.ExecuteTemplate(w, "index.html", data); err != nil {
+		http.Error(w, "template error", 500)
+		log.Printf("template error: %v", err)
+	}
+}
+
+func handleJoin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	email := strings.TrimSpace(r.FormValue("email"))
+	if email == "" || !strings.Contains(email, "@") || !strings.Contains(email, ".") {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<p class="mt-3 text-red-400 text-sm">Please enter a valid email address.</p>`)
+		return
+	}
+
+	_, err := db.Exec(
+		"INSERT INTO waitlist (email) VALUES ($1) ON CONFLICT (email) DO NOTHING",
+		email,
+	)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<p class="mt-3 text-red-400 text-sm">Something went wrong. Try again.</p>`)
+		log.Printf("insert error: %v", err)
+		return
+	}
+
+	n := signupCount()
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, `<div class="mt-4 py-4 px-6 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-center">
+  <p class="text-emerald-300 font-semibold text-lg">You're on the list! 🎉</p>
+  <p class="text-slate-400 text-sm mt-1">You're one of <strong class="text-white">%d</strong> people waiting for early access.</p>
+</div>`, n)
+}
+
+func handleCount(w http.ResponseWriter, r *http.Request) {
+	n := signupCount()
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w,
+		`<span hx-get="/count" hx-trigger="every 8s" hx-swap="outerHTML" class="font-bold text-emerald-400">%d</span>`,
+		n,
+	)
+}
